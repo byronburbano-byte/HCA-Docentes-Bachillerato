@@ -676,27 +676,20 @@
         'INSTRUMENTOS': { nombre: 'Instrumentos de Evaluación', icono: '📊' }
     };
 
-    // ===== ESTRUCTURA INDEPENDIENTE POR TIPO DE REVISIÓN =====
-    let datosPorRevision = {
-        'PCA': [],
-        'PUD': [],
-        'INSUMOS': [],
-        'REFUERZOS': [],
-        'PROYECTOS': [],
-        'INSTRUMENTOS': []
-    };
-
+    let datosPorRevision = {};
     let datosDocentes = [];
-    let contadorDocente = 1;
     let notificacionesPendientes = 0;
     let docenteActualNotificacion = null;
     let tipoRevisionActual = 'PCA';
     let firebaseReady = false;
     let guardando = false;
-    let ultimaActualizacionRemota = 0;
+    let ultimaActualizacionLocal = 0;
     let inicializado = false;
+    let primeraCargaRemota = true;
 
-    // ===== CREAR DATOS VACÍOS (TODOS PENDIENTES) =====
+    const LS_KEY = 'hca_heatmap_v3';
+
+    // ===== CREAR DATOS VACÍOS =====
     function crearDatosVacios() {
         const vacios = [];
         let id = 1;
@@ -718,35 +711,54 @@
         return vacios;
     }
 
+    function crearEstructuraVacia() {
+        const est = {};
+        Object.keys(tiposRevision).forEach(tipo => {
+            est[tipo] = crearDatosVacios();
+        });
+        return est;
+    }
+
+    // ===== LOCAL STORAGE =====
+    function guardarLocal() {
+        try {
+            datosPorRevision[tipoRevisionActual] = datosDocentes;
+            localStorage.setItem(LS_KEY, JSON.stringify({
+                datosPorRevision,
+                notificacionesPendientes,
+                tipoRevisionActual,
+                ts: Date.now()
+            }));
+        } catch(e) { console.warn('Error LS:', e); }
+    }
+
+    function cargarLocal() {
+        try {
+            const raw = localStorage.getItem(LS_KEY);
+            if (!raw) return false;
+            const p = JSON.parse(raw);
+            if (p.datosPorRevision) {
+                Object.keys(tiposRevision).forEach(tipo => {
+                    if (p.datosPorRevision[tipo] && Array.isArray(p.datosPorRevision[tipo]) && p.datosPorRevision[tipo].length > 0) {
+                        datosPorRevision[tipo] = p.datosPorRevision[tipo];
+                    }
+                });
+                notificacionesPendientes = p.notificacionesPendientes || 0;
+                ultimaActualizacionLocal = p.ts || 0;
+                return true;
+            }
+        } catch(e) { console.warn('Error cargando LS:', e); }
+        return false;
+    }
+
     // ===== INICIALIZACIÓN =====
     function inicializarApp() {
         if (inicializado) return;
         inicializado = true;
 
-        // Crear estructura vacía para cada tipo de revisión
-        Object.keys(tiposRevision).forEach(tipo => {
-            datosPorRevision[tipo] = crearDatosVacios();
-        });
+        datosPorRevision = crearEstructuraVacia();
+        cargarLocal();
 
-        // Intentar cargar desde localStorage
-        try {
-            const guardado = localStorage.getItem('checklistBachilleratoV2');
-            if (guardado) {
-                const parsed = JSON.parse(guardado);
-                if (parsed.datosPorRevision) {
-                    // Fusionar: solo reemplazar si existen datos
-                    Object.keys(tiposRevision).forEach(tipo => {
-                        if (parsed.datosPorRevision[tipo] && parsed.datosPorRevision[tipo].length > 0) {
-                            datosPorRevision[tipo] = parsed.datosPorRevision[tipo];
-                        }
-                    });
-                    notificacionesPendientes = parsed.notificacionesPendientes || 0;
-                    // NO sobrescribir tipoRevisionActual desde localStorage para evitar conflictos
-                }
-            }
-        } catch(e) { console.warn('Error cargando localStorage:', e); }
-
-        // Asegurar que la revisión actual tiene datos
         if (!datosPorRevision[tipoRevisionActual] || datosPorRevision[tipoRevisionActual].length === 0) {
             datosPorRevision[tipoRevisionActual] = crearDatosVacios();
         }
@@ -758,7 +770,7 @@
         actualizarIndicadorRevision();
     }
 
-    // ===== ESCUCHAR FIREBASE =====
+    // ===== FIREBASE =====
     function escucharFirebase() {
         const { db, doc, onSnapshot, DOC_ID } = window.fb;
         onSnapshot(doc(db, 'checklistBachillerato', DOC_ID), (snap) => {
@@ -766,18 +778,21 @@
                 firebaseReady = true;
                 actualizarEstadoConexion(true, 'Conectado en tiempo real');
             }
+
             if (!snap.exists()) {
+                console.log('📭 Documento no existe, creando...');
                 guardarEnFirebase(true);
                 return;
             }
-            const data = snap.data();
 
-            // Solo aplicar si el remoto es MÁS NUEVO que nuestra última actualización local
-            if (data.updatedAt && data.updatedAt > ultimaActualizacionRemota) {
-                ultimaActualizacionRemota = data.updatedAt;
+            const data = snap.data();
+            const tsRemoto = data.ts || 0;
+
+            if (tsRemoto > ultimaActualizacionLocal) {
+                console.log('📥 Aplicando datos remotos (ts remoto:', tsRemoto, '> local:', ultimaActualizacionLocal, ')');
+                ultimaActualizacionLocal = tsRemoto;
 
                 if (data.datosPorRevision) {
-                    // Fusionar datos por revisión (no reemplazar si remoto está vacío y local tiene datos)
                     Object.keys(tiposRevision).forEach(tipo => {
                         if (data.datosPorRevision[tipo] && data.datosPorRevision[tipo].length > 0) {
                             datosPorRevision[tipo] = data.datosPorRevision[tipo];
@@ -786,58 +801,64 @@
                     datosDocentes = datosPorRevision[tipoRevisionActual] || crearDatosVacios();
                     notificacionesPendientes = data.notificacionesPendientes || 0;
 
-                    // NO cambiar tipoRevisionActual desde remoto si el usuario está trabajando
-                    // Solo cambiar si no hay interacción local
-                    if (data.tipoRevisionActual && !guardando) {
-                        // Solo actualizar el selector visual si es diferente
-                        // pero mantener el tipo actual del usuario
-                    }
-
                     renderizarTodo();
+                    guardarLocal();
                     actualizarUltimaModificacion(data.fechaModificacion, data.usuarioModifico);
-                    mostrarNotificacion('🔄 Actualizado desde otro dispositivo', 'info');
+
+                    if (!primeraCargaRemota) {
+                        mostrarNotificacion('🔄 Actualizado desde otro dispositivo', 'info');
+                    }
                 }
+            } else {
+                console.log('⏭️ Ignorando remoto (ts remoto:', tsRemoto, '<= local:', ultimaActualizacionLocal, ')');
             }
+            primeraCargaRemota = false;
         }, (error) => {
-            console.error('Error en onSnapshot:', error);
+            console.error('❌ Error onSnapshot:', error);
             actualizarEstadoConexion(false, 'Error de conexión');
+            mostrarNotificacion('❌ Error de conexión a Firebase', 'danger');
         });
     }
 
-    // ===== GUARDAR EN FIREBASE =====
     async function guardarEnFirebase(silencioso = false) {
-        if (!firebaseReady || guardando) return;
+        if (!firebaseReady || guardando) {
+            console.warn('⏸️ Guardado bloqueado. firebaseReady:', firebaseReady, 'guardando:', guardando);
+            return;
+        }
         try {
             guardando = true;
             const { db, doc, setDoc, DOC_ID } = window.fb;
-            const ahora = new Date().toISOString();
-            ultimaActualizacionRemota = ahora;
 
-            // Sincronizar el array actual con la estructura por revisión
             datosPorRevision[tipoRevisionActual] = datosDocentes;
 
-            await setDoc(doc(db, 'checklistBachillerato', DOC_ID), {
+            const ts = Date.now();
+            ultimaActualizacionLocal = ts;
+
+            guardarLocal();
+
+            const payload = {
                 datosPorRevision,
                 notificacionesPendientes,
                 tipoRevisionActual,
-                updatedAt: ahora,
+                ts,
                 fechaModificacion: new Date().toLocaleString('es-ES'),
                 usuarioModifico: 'Coordinador'
-            });
+            };
 
-            // Guardar en localStorage también
-            try {
-                localStorage.setItem('checklistBachilleratoV2', JSON.stringify({
-                    datosPorRevision,
-                    notificacionesPendientes,
-                    tipoRevisionActual
-                }));
-            } catch(e) {}
+            console.log('💾 Guardando en Firebase... ts:', ts);
+            await setDoc(doc(db, 'checklistBachillerato', DOC_ID), payload);
+            console.log('✅ Guardado OK');
 
             if (!silencioso) mostrarNotificacion('💾 Guardado en la nube', 'success');
         } catch (e) {
-            console.error('Error al guardar:', e);
-            if (!silencioso) mostrarNotificacion('❌ Error al guardar', 'danger');
+            console.error('❌ Error al guardar:', e);
+            if (!silencioso) {
+                if (e.code === 'permission-denied') {
+                    mostrarNotificacion('❌ Sin permisos en Firestore. Revisa las reglas.', 'danger');
+                } else {
+                    mostrarNotificacion('❌ Error al guardar: ' + e.message, 'danger');
+                }
+            }
         } finally {
             guardando = false;
         }
@@ -857,17 +878,13 @@
         if (fecha) el.innerHTML = `Última actualización: ${fecha}${usuario ? ' por ' + usuario : ''}`;
     }
 
-    // ===== CAMBIO DE TIPO DE REVISIÓN =====
+    // ===== CAMBIO DE REVISIÓN =====
     function cambiarTipoRevision() {
         const nuevoTipo = document.getElementById('tipoRevision').value;
 
-        // 1. Guardar los datos actuales en la estructura por revisión
         datosPorRevision[tipoRevisionActual] = datosDocentes;
-
-        // 2. Cambiar al nuevo tipo
         tipoRevisionActual = nuevoTipo;
 
-        // 3. Cargar los datos de esa revisión (o crear vacíos si no existen)
         if (!datosPorRevision[tipoRevisionActual] || datosPorRevision[tipoRevisionActual].length === 0) {
             datosPorRevision[tipoRevisionActual] = crearDatosVacios();
         }
@@ -875,6 +892,7 @@
 
         actualizarIndicadorRevision();
         renderizarTodo();
+        guardarLocal();
         guardarEnFirebase(true);
 
         mostrarNotificacion(`Cambiado a: ${tiposRevision[tipoRevisionActual].nombre}`, 'info');
@@ -966,9 +984,9 @@
         d.entregado = checked;
         if (checked && !d.fechaEntrega) d.fechaEntrega = new Date().toISOString().split('T')[0];
         if (!checked) d.fechaEntrega = '';
-        // Sincronizar con la estructura por revisión
         datosPorRevision[tipoRevisionActual] = datosDocentes;
         renderizarTodo();
+        guardarLocal();
         guardarEnFirebase(true);
     }
 
@@ -976,7 +994,7 @@
         const d = datosDocentes.find(x => x.id === id);
         if (d) d[campo] = valor;
         datosPorRevision[tipoRevisionActual] = datosDocentes;
-        renderizarTodo();
+        guardarLocal();
         guardarEnFirebase(true);
     }
 
@@ -1001,6 +1019,7 @@
             notificacionesPendientes++;
             datosPorRevision[tipoRevisionActual] = datosDocentes;
             renderizarTodo();
+            guardarLocal();
             guardarEnFirebase(true);
             cerrarModal();
             mostrarNotificacion(`📧 Recordatorio enviado a ${docenteActualNotificacion.docente}`, 'info');
@@ -1019,6 +1038,7 @@
         notificacionesPendientes = 0;
         datosPorRevision[tipoRevisionActual] = datosDocentes;
         renderizarTodo();
+        guardarLocal();
         guardarEnFirebase(true);
         mostrarNotificacion('✅ Todos marcados como completos', 'info');
     }
@@ -1032,6 +1052,7 @@
         notificacionesPendientes = 0;
         datosPorRevision[tipoRevisionActual] = datosDocentes;
         renderizarTodo();
+        guardarLocal();
         guardarEnFirebase(true);
         mostrarNotificacion('🔄 Datos reiniciados', 'warning');
     }
