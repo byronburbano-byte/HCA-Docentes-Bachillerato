@@ -676,6 +676,16 @@
         'INSTRUMENTOS': { nombre: 'Instrumentos de Evaluación', icono: '📊' }
     };
 
+    // ===== ESTRUCTURA INDEPENDIENTE POR TIPO DE REVISIÓN =====
+    let datosPorRevision = {
+        'PCA': [],
+        'PUD': [],
+        'INSUMOS': [],
+        'REFUERZOS': [],
+        'PROYECTOS': [],
+        'INSTRUMENTOS': []
+    };
+
     let datosDocentes = [];
     let contadorDocente = 1;
     let notificacionesPendientes = 0;
@@ -684,14 +694,16 @@
     let firebaseReady = false;
     let guardando = false;
     let ultimaActualizacionRemota = 0;
+    let inicializado = false;
 
-    function generarDatosIniciales() {
-        datosDocentes = [];
-        contadorDocente = 1;
+    // ===== CREAR DATOS VACÍOS (TODOS PENDIENTES) =====
+    function crearDatosVacios() {
+        const vacios = [];
+        let id = 1;
         Object.keys(datosIniciales).forEach(nivel => {
             datosIniciales[nivel].forEach(item => {
-                datosDocentes.push({
-                    id: contadorDocente++,
+                vacios.push({
+                    id: id++,
                     nivel: nivel,
                     docente: item.docente,
                     materia: item.materia,
@@ -703,28 +715,50 @@
                 });
             });
         });
+        return vacios;
     }
 
+    // ===== INICIALIZACIÓN =====
     function inicializarApp() {
-        generarDatosIniciales();
+        if (inicializado) return;
+        inicializado = true;
+
+        // Crear estructura vacía para cada tipo de revisión
+        Object.keys(tiposRevision).forEach(tipo => {
+            datosPorRevision[tipo] = crearDatosVacios();
+        });
+
+        // Intentar cargar desde localStorage
         try {
-            const guardado = localStorage.getItem('checklistBachillerato');
+            const guardado = localStorage.getItem('checklistBachilleratoV2');
             if (guardado) {
                 const parsed = JSON.parse(guardado);
-                if (parsed.datosDocentes && parsed.datosDocentes.length === datosDocentes.length) {
-                    datosDocentes = parsed.datosDocentes;
-                    contadorDocente = parsed.contadorDocente || datosDocentes.length + 1;
+                if (parsed.datosPorRevision) {
+                    // Fusionar: solo reemplazar si existen datos
+                    Object.keys(tiposRevision).forEach(tipo => {
+                        if (parsed.datosPorRevision[tipo] && parsed.datosPorRevision[tipo].length > 0) {
+                            datosPorRevision[tipo] = parsed.datosPorRevision[tipo];
+                        }
+                    });
                     notificacionesPendientes = parsed.notificacionesPendientes || 0;
-                    tipoRevisionActual = parsed.tipoRevisionActual || 'PCA';
+                    // NO sobrescribir tipoRevisionActual desde localStorage para evitar conflictos
                 }
             }
-        } catch(e) { }
+        } catch(e) { console.warn('Error cargando localStorage:', e); }
+
+        // Asegurar que la revisión actual tiene datos
+        if (!datosPorRevision[tipoRevisionActual] || datosPorRevision[tipoRevisionActual].length === 0) {
+            datosPorRevision[tipoRevisionActual] = crearDatosVacios();
+        }
+        datosDocentes = datosPorRevision[tipoRevisionActual];
+
         renderizarTodo();
         document.getElementById('fechaActual').value = new Date().toISOString().split('T')[0];
         document.getElementById('tipoRevision').value = tipoRevisionActual;
         actualizarIndicadorRevision();
     }
 
+    // ===== ESCUCHAR FIREBASE =====
     function escucharFirebase() {
         const { db, doc, onSnapshot, DOC_ID } = window.fb;
         onSnapshot(doc(db, 'checklistBachillerato', DOC_ID), (snap) => {
@@ -737,14 +771,28 @@
                 return;
             }
             const data = snap.data();
-            if (data.updatedAt && data.updatedAt !== ultimaActualizacionRemota) {
+
+            // Solo aplicar si el remoto es MÁS NUEVO que nuestra última actualización local
+            if (data.updatedAt && data.updatedAt > ultimaActualizacionRemota) {
                 ultimaActualizacionRemota = data.updatedAt;
-                if (data.datosDocentes) {
-                    datosDocentes = data.datosDocentes;
+
+                if (data.datosPorRevision) {
+                    // Fusionar datos por revisión (no reemplazar si remoto está vacío y local tiene datos)
+                    Object.keys(tiposRevision).forEach(tipo => {
+                        if (data.datosPorRevision[tipo] && data.datosPorRevision[tipo].length > 0) {
+                            datosPorRevision[tipo] = data.datosPorRevision[tipo];
+                        }
+                    });
+                    datosDocentes = datosPorRevision[tipoRevisionActual] || crearDatosVacios();
                     notificacionesPendientes = data.notificacionesPendientes || 0;
-                    tipoRevisionActual = data.tipoRevisionActual || 'PCA';
-                    document.getElementById('tipoRevision').value = tipoRevisionActual;
-                    actualizarIndicadorRevision();
+
+                    // NO cambiar tipoRevisionActual desde remoto si el usuario está trabajando
+                    // Solo cambiar si no hay interacción local
+                    if (data.tipoRevisionActual && !guardando) {
+                        // Solo actualizar el selector visual si es diferente
+                        // pero mantener el tipo actual del usuario
+                    }
+
                     renderizarTodo();
                     actualizarUltimaModificacion(data.fechaModificacion, data.usuarioModifico);
                     mostrarNotificacion('🔄 Actualizado desde otro dispositivo', 'info');
@@ -756,6 +804,7 @@
         });
     }
 
+    // ===== GUARDAR EN FIREBASE =====
     async function guardarEnFirebase(silencioso = false) {
         if (!firebaseReady || guardando) return;
         try {
@@ -763,19 +812,28 @@
             const { db, doc, setDoc, DOC_ID } = window.fb;
             const ahora = new Date().toISOString();
             ultimaActualizacionRemota = ahora;
+
+            // Sincronizar el array actual con la estructura por revisión
+            datosPorRevision[tipoRevisionActual] = datosDocentes;
+
             await setDoc(doc(db, 'checklistBachillerato', DOC_ID), {
-                datosDocentes,
+                datosPorRevision,
                 notificacionesPendientes,
                 tipoRevisionActual,
                 updatedAt: ahora,
                 fechaModificacion: new Date().toLocaleString('es-ES'),
                 usuarioModifico: 'Coordinador'
             });
+
+            // Guardar en localStorage también
             try {
-                localStorage.setItem('checklistBachillerato', JSON.stringify({
-                    datosDocentes, contadorDocente, notificacionesPendientes, tipoRevisionActual
+                localStorage.setItem('checklistBachilleratoV2', JSON.stringify({
+                    datosPorRevision,
+                    notificacionesPendientes,
+                    tipoRevisionActual
                 }));
             } catch(e) {}
+
             if (!silencioso) mostrarNotificacion('💾 Guardado en la nube', 'success');
         } catch (e) {
             console.error('Error al guardar:', e);
@@ -799,11 +857,27 @@
         if (fecha) el.innerHTML = `Última actualización: ${fecha}${usuario ? ' por ' + usuario : ''}`;
     }
 
+    // ===== CAMBIO DE TIPO DE REVISIÓN =====
     function cambiarTipoRevision() {
-        tipoRevisionActual = document.getElementById('tipoRevision').value;
+        const nuevoTipo = document.getElementById('tipoRevision').value;
+
+        // 1. Guardar los datos actuales en la estructura por revisión
+        datosPorRevision[tipoRevisionActual] = datosDocentes;
+
+        // 2. Cambiar al nuevo tipo
+        tipoRevisionActual = nuevoTipo;
+
+        // 3. Cargar los datos de esa revisión (o crear vacíos si no existen)
+        if (!datosPorRevision[tipoRevisionActual] || datosPorRevision[tipoRevisionActual].length === 0) {
+            datosPorRevision[tipoRevisionActual] = crearDatosVacios();
+        }
+        datosDocentes = datosPorRevision[tipoRevisionActual];
+
         actualizarIndicadorRevision();
-        mostrarNotificacion(`Cambiado a: ${tiposRevision[tipoRevisionActual].nombre}`, 'info');
+        renderizarTodo();
         guardarEnFirebase(true);
+
+        mostrarNotificacion(`Cambiado a: ${tiposRevision[tipoRevisionActual].nombre}`, 'info');
     }
 
     function actualizarIndicadorRevision() {
@@ -892,6 +966,8 @@
         d.entregado = checked;
         if (checked && !d.fechaEntrega) d.fechaEntrega = new Date().toISOString().split('T')[0];
         if (!checked) d.fechaEntrega = '';
+        // Sincronizar con la estructura por revisión
+        datosPorRevision[tipoRevisionActual] = datosDocentes;
         renderizarTodo();
         guardarEnFirebase(true);
     }
@@ -899,6 +975,7 @@
     function actualizarCampo(id, campo, valor) {
         const d = datosDocentes.find(x => x.id === id);
         if (d) d[campo] = valor;
+        datosPorRevision[tipoRevisionActual] = datosDocentes;
         renderizarTodo();
         guardarEnFirebase(true);
     }
@@ -922,6 +999,7 @@
             docenteActualNotificacion.notificado = true;
             docenteActualNotificacion.fechaNotificacion = fechaActual.split(',')[0];
             notificacionesPendientes++;
+            datosPorRevision[tipoRevisionActual] = datosDocentes;
             renderizarTodo();
             guardarEnFirebase(true);
             cerrarModal();
@@ -930,7 +1008,7 @@
     }
 
     function marcarTodosCompletos() {
-        if (!confirm('¿Marcar TODOS los docentes como Completados?')) return;
+        if (!confirm('¿Marcar TODOS los docentes como Completados en esta revisión?')) return;
         const fecha = new Date().toISOString().split('T')[0];
         datosDocentes.forEach(d => {
             d.entregado = true;
@@ -939,18 +1017,20 @@
             if (!d.fechaEntrega) d.fechaEntrega = fecha;
         });
         notificacionesPendientes = 0;
+        datosPorRevision[tipoRevisionActual] = datosDocentes;
         renderizarTodo();
         guardarEnFirebase(true);
         mostrarNotificacion('✅ Todos marcados como completos', 'info');
     }
 
     function limpiarTodo() {
-        if (!confirm('¿Reiniciar todos los estados a Pendiente?')) return;
+        if (!confirm('¿Reiniciar todos los estados a Pendiente en esta revisión?')) return;
         datosDocentes.forEach(d => {
             d.entregado = false; d.fechaEntrega = ''; d.observaciones = '';
             d.notificado = false; d.fechaNotificacion = '';
         });
         notificacionesPendientes = 0;
+        datosPorRevision[tipoRevisionActual] = datosDocentes;
         renderizarTodo();
         guardarEnFirebase(true);
         mostrarNotificacion('🔄 Datos reiniciados', 'warning');
@@ -1027,7 +1107,7 @@
     });
 
     window.onload = () => {
-        setTimeout(() => { if (!firebaseReady) inicializarApp(); }, 500);
+        setTimeout(() => { if (!inicializado) inicializarApp(); }, 800);
     };
 </script>
 
